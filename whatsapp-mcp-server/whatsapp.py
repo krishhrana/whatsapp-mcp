@@ -1,19 +1,36 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
-import os.path
+from pathlib import Path
+from typing import Optional, Tuple
+import os
 import requests
 import json
 import audio
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = os.getenv("WHATSAPP_BRIDGE_API_BASE_URL", "http://127.0.0.1:8080")
+
+
+def _validated_bridge_auth_headers(auth_headers: dict[str, str] | None) -> dict[str, str]:
+    if not auth_headers:
+        raise RuntimeError("Missing Authorization header for bridge request.")
+    auth_value = str(auth_headers.get("Authorization") or "").strip()
+    if not auth_value.lower().startswith("bearer "):
+        raise RuntimeError("Bridge Authorization header must be a Bearer token.")
+    return {"Authorization": auth_value}
+
+
+def _get_db_connection() -> sqlite3.Connection:
+    return sqlite3.connect(MESSAGES_DB_PATH)
 
 @dataclass
 class Message:
     timestamp: datetime
-    sender: str
+    sender_id: str
     content: str
     is_from_me: bool
     chat_jid: str
@@ -23,76 +40,189 @@ class Message:
 
 @dataclass
 class Chat:
-    jid: str
+    chat_jid: str
     name: Optional[str]
     last_message_time: Optional[datetime]
     last_message: Optional[str] = None
-    last_sender: Optional[str] = None
+    last_sender_id: Optional[str] = None
     last_is_from_me: Optional[bool] = None
 
     @property
     def is_group(self) -> bool:
         """Determine if chat is a group based on JID pattern."""
-        return self.jid.endswith("@g.us")
+        return self.chat_jid.endswith("@g.us")
 
 @dataclass
 class Contact:
-    phone_number: str
+    sender_id: str
     name: Optional[str]
-    jid: str
+    chat_jid: str
 
 @dataclass
 class MessageContext:
     message: Message
-    before: List[Message]
-    after: List[Message]
+    before: list[Message]
+    after: list[Message]
 
-def get_sender_name(sender_jid: str) -> str:
+
+def _parse_iso_timestamp(value: str, field_name: str) -> str:
+    """Parse strict ISO timestamp input into ISO-8601 with timezone."""
+    raw = value.strip()
+    if not raw:
+        raise ValueError(f"Invalid empty timestamp for '{field_name}'")
+
+    now_tz = datetime.now().astimezone().tzinfo
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-        
-        # First try matching by exact JID
-        cursor.execute("""
-            SELECT name
-            FROM chats
-            WHERE jid = ?
-            LIMIT 1
-        """, (sender_jid,))
-        
-        result = cursor.fetchone()
-        
-        # If no result, try looking for the number within JIDs
-        if not result:
-            # Extract the phone number part if it's a JID
-            if '@' in sender_jid:
-                phone_part = sender_jid.split('@')[0]
-            else:
-                phone_part = sender_jid
-                
-            cursor.execute("""
-                SELECT name
-                FROM chats
-                WHERE jid LIKE ?
-                LIMIT 1
-            """, (f"%{phone_part}%",))
-            
-            result = cursor.fetchone()
-        
-        if result and result[0]:
-            return result[0]
+        candidate = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        parsed = datetime.fromisoformat(candidate)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=now_tz)
+        return parsed.isoformat()
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid ISO timestamp for '{field_name}': {value}. "
+            "Use ISO-8601, for example 2026-02-20T12:00:00-08:00."
+        ) from exc
+
+
+def _resolve_time_window(
+    *,
+    after_iso: Optional[str] = None,
+    before_iso: Optional[str] = None,
+    lookback_value: Optional[int] = None,
+    lookback_unit: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve absolute/relative time window into (after, before) ISO-8601 timestamps.
+
+    Rules:
+    - Absolute mode: use after_iso and/or before_iso
+    - Relative mode: use both lookback_value and lookback_unit (h|d|w)
+    - Absolute and relative modes are mutually exclusive
+    """
+    has_absolute = bool(after_iso or before_iso)
+    has_relative = lookback_value is not None or lookback_unit is not None
+
+    if has_absolute and has_relative:
+        raise ValueError(
+            "Use either absolute bounds (after_iso/before_iso) or relative bounds "
+            "(lookback_value + lookback_unit), not both."
+        )
+
+    if has_relative:
+        if lookback_value is None or lookback_unit is None:
+            raise ValueError(
+                "Relative bounds require both lookback_value and lookback_unit."
+            )
+        if lookback_value <= 0:
+            raise ValueError("lookback_value must be greater than 0.")
+
+        unit = lookback_unit.strip().lower()
+        if unit == "h":
+            delta = timedelta(hours=lookback_value)
+        elif unit == "d":
+            delta = timedelta(days=lookback_value)
+        elif unit == "w":
+            delta = timedelta(weeks=lookback_value)
         else:
-            return sender_jid
-        
+            raise ValueError("lookback_unit must be one of: h, d, w.")
+
+        now = datetime.now().astimezone()
+        return (now - delta).isoformat(), now.isoformat()
+
+    resolved_after = _parse_iso_timestamp(after_iso, "after_iso") if after_iso else None
+    resolved_before = _parse_iso_timestamp(before_iso, "before_iso") if before_iso else None
+
+    if resolved_after and resolved_before:
+        after_dt = datetime.fromisoformat(resolved_after)
+        before_dt = datetime.fromisoformat(resolved_before)
+        if after_dt >= before_dt:
+            raise ValueError("after_iso must be earlier than before_iso.")
+
+    return resolved_after, resolved_before
+
+def _canonical_sender_id(value: str) -> str:
+    sender_id = value.strip()
+    if not sender_id:
+        return ""
+    if "@" in sender_id:
+        raise ValueError("sender_id must be the canonical normalized user ID without JID suffix")
+    return sender_id
+
+def _direct_chat_jid(sender_id: str) -> str:
+    return f"{_canonical_sender_id(sender_id)}@s.whatsapp.net"
+
+def _direct_chat_jids_for_candidates(sender_ids: list[str]) -> list[str]:
+    chat_jids: list[str] = []
+    seen: set[str] = set()
+    for sender_id in sender_ids:
+        canonical_id = _canonical_sender_id(sender_id)
+        for chat_jid in (canonical_id, _direct_chat_jid(canonical_id)):
+            if chat_jid and chat_jid not in seen:
+                seen.add(chat_jid)
+                chat_jids.append(chat_jid)
+    return chat_jids
+
+def _sender_id_candidates(conn: sqlite3.Connection, sender_id: str) -> tuple[list[str], str]:
+    canonical = _canonical_sender_id(sender_id)
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT canonical_id FROM sender_id_aliases WHERE alias_id = ? LIMIT 1",
+            (canonical,),
+        )
+        row = cursor.fetchone()
+        resolved_canonical = row[0] if row and row[0] else canonical
+
+        cursor.execute(
+            "SELECT alias_id FROM sender_id_aliases WHERE canonical_id = ?",
+            (resolved_canonical,),
+        )
+        aliases = {resolved_canonical}
+        for alias_row in cursor.fetchall():
+            if alias_row and alias_row[0]:
+                aliases.add(alias_row[0])
+        return sorted(aliases), resolved_canonical
+    except sqlite3.OperationalError:
+        # Alias table may not be initialized yet; keep canonical-only fallback.
+        return [canonical], canonical
+
+def get_sender_name(sender_id: str) -> str:
+    try:
+        sender_id = _canonical_sender_id(sender_id)
+        if not sender_id:
+            return sender_id
+
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+        sender_candidates, resolved_canonical = _sender_id_candidates(conn, sender_id)
+        ordered_candidates = [resolved_canonical] + [
+            candidate for candidate in sender_candidates if candidate != resolved_canonical
+        ]
+
+        for candidate in ordered_candidates:
+            for chat_jid in _direct_chat_jids_for_candidates([candidate]):
+                cursor.execute("""
+                    SELECT name
+                    FROM chats
+                    WHERE jid = ?
+                    LIMIT 1
+                """, (chat_jid,))
+                result = cursor.fetchone()
+                if result and result[0]:
+                    return result[0]
+
+        return resolved_canonical
+
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
-        return sender_jid
+        return sender_id
     finally:
         if 'conn' in locals():
             conn.close()
 
-def format_message(message: Message, show_chat_info: bool = True) -> None:
-    """Print a single message with consistent formatting."""
+def format_message(message: Message, show_chat_info: bool = True) -> str:
+    """Format a single message as text."""
     output = ""
     
     if show_chat_info and message.chat_name:
@@ -105,13 +235,14 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
     
     try:
-        sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
+        sender_name = get_sender_name(message.sender_id) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
     return output
 
-def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
+def format_messages_list(messages: list[Message], show_chat_info: bool = True) -> str:
+    """Format a list of messages as text."""
     output = ""
     if not messages:
         output += "No messages to display."
@@ -121,10 +252,10 @@ def format_messages_list(messages: List[Message], show_chat_info: bool = True) -
         output += format_message(message, show_chat_info)
     return output
 
-def list_messages(
+def _query_messages(
     after: Optional[str] = None,
     before: Optional[str] = None,
-    sender_phone_number: Optional[str] = None,
+    sender_id: Optional[str] = None,
     chat_jid: Optional[str] = None,
     query: Optional[str] = None,
     limit: int = 20,
@@ -132,10 +263,15 @@ def list_messages(
     include_context: bool = True,
     context_before: int = 1,
     context_after: int = 1
-) -> List[Message]:
-    """Get messages matching the specified criteria with optional context."""
+) -> list[Message] | list[MessageContext]:
+    """Internal query helper for message retrieval and full-text search.
+
+    Returns:
+        - include_context=False: List[Message]
+        - include_context=True: List[MessageContext]
+    """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _get_db_connection()
         cursor = conn.cursor()
         
         # Build base query
@@ -146,26 +282,20 @@ def list_messages(
         
         # Add filters
         if after:
-            try:
-                after = datetime.fromisoformat(after)
-            except ValueError:
-                raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
-            
+            after = _parse_iso_timestamp(after, "after")
             where_clauses.append("messages.timestamp > ?")
             params.append(after)
 
         if before:
-            try:
-                before = datetime.fromisoformat(before)
-            except ValueError:
-                raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
-            
+            before = _parse_iso_timestamp(before, "before")
             where_clauses.append("messages.timestamp < ?")
             params.append(before)
 
-        if sender_phone_number:
-            where_clauses.append("messages.sender = ?")
-            params.append(sender_phone_number)
+        if sender_id:
+            sender_candidates, _ = _sender_id_candidates(conn, sender_id)
+            placeholders = ", ".join(["?"] * len(sender_candidates))
+            where_clauses.append(f"messages.sender IN ({placeholders})")
+            params.extend(sender_candidates)
             
         if chat_jid:
             where_clauses.append("messages.chat_jid = ?")
@@ -191,7 +321,7 @@ def list_messages(
         for msg in messages:
             message = Message(
                 timestamp=datetime.fromisoformat(msg[0]),
-                sender=msg[1],
+                sender_id=msg[1],
                 chat_name=msg[2],
                 content=msg[3],
                 is_from_me=msg[4],
@@ -202,18 +332,14 @@ def list_messages(
             result.append(message)
             
         if include_context and result:
-            # Add context for each message
-            messages_with_context = []
+            messages_with_context: list[MessageContext] = []
             for msg in result:
-                context = get_message_context(msg.id, context_before, context_after)
-                messages_with_context.extend(context.before)
-                messages_with_context.append(context.message)
-                messages_with_context.extend(context.after)
-            
-            return format_messages_list(messages_with_context, show_chat_info=True)
-            
-        # Format and display messages without context
-        return format_messages_list(result, show_chat_info=True)    
+                messages_with_context.append(
+                    get_message_context(msg.id, context_before, context_after)
+                )
+            return messages_with_context
+
+        return result
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -223,6 +349,215 @@ def list_messages(
             conn.close()
 
 
+def list_messages(
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    sender_id: Optional[str] = None,
+    chat_jid: Optional[str] = None,
+    limit: int = 20,
+    page: int = 0,
+    include_context: bool = True,
+    context_before: int = 1,
+    context_after: int = 1
+) -> list[Message] | list[MessageContext]:
+    """Get messages with optional sender/chat/date filters and context.
+
+    Note:
+        Full-text content search is intentionally excluded from this API.
+        Use search_messages() for query-based search.
+    """
+    return _query_messages(
+        after=after,
+        before=before,
+        sender_id=sender_id,
+        chat_jid=chat_jid,
+        query=None,
+        limit=limit,
+        page=page,
+        include_context=include_context,
+        context_before=context_before,
+        context_after=context_after,
+    )
+
+
+def list_messages_for_sender_id(
+    sender_id: str,
+    after_iso: Optional[str] = None,
+    before_iso: Optional[str] = None,
+    lookback_value: Optional[int] = None,
+    lookback_unit: Optional[str] = None,
+    limit: int = 20,
+    page: int = 0,
+    include_context: bool = True,
+    context_before: int = 1,
+    context_after: int = 1,
+) -> list[Message] | list[MessageContext]:
+    """Get messages for a specific sender_id with optional time window and context."""
+    normalized_sender_id = _canonical_sender_id(sender_id)
+    if not normalized_sender_id:
+        raise ValueError("sender_id must be a non-empty string")
+    resolved_after, resolved_before = _resolve_time_window(
+        after_iso=after_iso,
+        before_iso=before_iso,
+        lookback_value=lookback_value,
+        lookback_unit=lookback_unit,
+    )
+
+    return list_messages(
+        after=resolved_after,
+        before=resolved_before,
+        sender_id=normalized_sender_id,
+        chat_jid=None,
+        limit=limit,
+        page=page,
+        include_context=include_context,
+        context_before=context_before,
+        context_after=context_after,
+    )
+
+
+def list_messages_for_chat_id(
+    chat_jid: str,
+    after_iso: Optional[str] = None,
+    before_iso: Optional[str] = None,
+    lookback_value: Optional[int] = None,
+    lookback_unit: Optional[str] = None,
+    limit: int = 20,
+    page: int = 0,
+    include_context: bool = True,
+    context_before: int = 1,
+    context_after: int = 1,
+) -> list[Message] | list[MessageContext]:
+    """Get messages for a specific chat_jid with optional time window and context."""
+    normalized_chat_jid = chat_jid.strip()
+    if not normalized_chat_jid:
+        raise ValueError("chat_jid must be a non-empty string")
+    resolved_after, resolved_before = _resolve_time_window(
+        after_iso=after_iso,
+        before_iso=before_iso,
+        lookback_value=lookback_value,
+        lookback_unit=lookback_unit,
+    )
+
+    return list_messages(
+        after=resolved_after,
+        before=resolved_before,
+        sender_id=None,
+        chat_jid=normalized_chat_jid,
+        limit=limit,
+        page=page,
+        include_context=include_context,
+        context_before=context_before,
+        context_after=context_after,
+    )
+
+
+def search_messages(
+    query: Optional[str] = None,
+    sender_id: Optional[str] = None,
+    page: int = 0,
+    limit: int = 20,
+    after_iso: Optional[str] = None,
+    before_iso: Optional[str] = None,
+    lookback_value: Optional[int] = None,
+    lookback_unit: Optional[str] = None,
+) -> list[Message]:
+    """Search message content with pagination and optional time window.
+
+    Args:
+        query: Optional message content query (case-insensitive partial match)
+        sender_id: Optional canonical normalized user ID to filter by sender
+        page: Page number for pagination (0-based)
+        limit: Max number of results per page
+        after_iso: Optional lower ISO-8601 timestamp bound (exclusive)
+        before_iso: Optional upper ISO-8601 timestamp bound (exclusive)
+        lookback_value: Optional relative lookback amount
+        lookback_unit: Optional lookback unit, one of h, d, w
+    """
+    normalized_query = (query or "").strip()
+    if page < 0:
+        raise ValueError("page must be greater than or equal to 0")
+    if limit <= 0:
+        raise ValueError("limit must be greater than 0")
+    resolved_after, resolved_before = _resolve_time_window(
+        after_iso=after_iso,
+        before_iso=before_iso,
+        lookback_value=lookback_value,
+        lookback_unit=lookback_unit,
+    )
+    if not normalized_query and not (resolved_before or resolved_after):
+        raise ValueError(
+            "Either a non-empty query or a time window must be provided."
+        )
+
+    return _query_messages(
+        after=resolved_after,
+        before=resolved_before,
+        sender_id=sender_id,
+        chat_jid=None,
+        query=normalized_query if normalized_query else None,
+        limit=limit,
+        page=page,
+        include_context=False,
+        context_before=1,
+        context_after=1,
+    )
+
+
+def search_chat_messages(
+    chat_jid: str,
+    query: str,
+    page: int = 0,
+    limit: int = 20,
+    after_iso: Optional[str] = None,
+    before_iso: Optional[str] = None,
+    lookback_value: Optional[int] = None,
+    lookback_unit: Optional[str] = None,
+) -> list[Message]:
+    """Search message content within a specific chat and optional time window.
+
+    Args:
+        chat_jid: Chat JID to scope the search to
+        query: Message content query (case-insensitive partial match)
+        page: Page number for pagination (0-based)
+        limit: Max number of results per page
+        after_iso: Optional lower ISO-8601 timestamp bound (exclusive)
+        before_iso: Optional upper ISO-8601 timestamp bound (exclusive)
+        lookback_value: Optional relative lookback amount
+        lookback_unit: Optional lookback unit, one of h, d, w
+    """
+    normalized_chat_jid = chat_jid.strip()
+    normalized_query = query.strip()
+
+    if not normalized_chat_jid:
+        raise ValueError("chat_jid must be a non-empty string")
+    if not normalized_query:
+        raise ValueError("query must be a non-empty string")
+    if page < 0:
+        raise ValueError("page must be greater than or equal to 0")
+    if limit <= 0:
+        raise ValueError("limit must be greater than 0")
+    resolved_after, resolved_before = _resolve_time_window(
+        after_iso=after_iso,
+        before_iso=before_iso,
+        lookback_value=lookback_value,
+        lookback_unit=lookback_unit,
+    )
+
+    return _query_messages(
+        after=resolved_after,
+        before=resolved_before,
+        sender_id=None,
+        chat_jid=normalized_chat_jid,
+        query=normalized_query,
+        limit=limit,
+        page=page,
+        include_context=False,
+        context_before=1,
+        context_after=1,
+    )
+
+
 def get_message_context(
     message_id: str,
     before: int = 5,
@@ -230,7 +565,7 @@ def get_message_context(
 ) -> MessageContext:
     """Get context around a specific message."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _get_db_connection()
         cursor = conn.cursor()
         
         # Get the target message first
@@ -247,7 +582,7 @@ def get_message_context(
             
         target_message = Message(
             timestamp=datetime.fromisoformat(msg_data[0]),
-            sender=msg_data[1],
+            sender_id=msg_data[1],
             chat_name=msg_data[2],
             content=msg_data[3],
             is_from_me=msg_data[4],
@@ -270,7 +605,7 @@ def get_message_context(
         for msg in cursor.fetchall():
             before_messages.append(Message(
                 timestamp=datetime.fromisoformat(msg[0]),
-                sender=msg[1],
+                sender_id=msg[1],
                 chat_name=msg[2],
                 content=msg[3],
                 is_from_me=msg[4],
@@ -293,7 +628,7 @@ def get_message_context(
         for msg in cursor.fetchall():
             after_messages.append(Message(
                 timestamp=datetime.fromisoformat(msg[0]),
-                sender=msg[1],
+                sender_id=msg[1],
                 chat_name=msg[2],
                 content=msg[3],
                 is_from_me=msg[4],
@@ -322,20 +657,20 @@ def list_chats(
     page: int = 0,
     include_last_message: bool = True,
     sort_by: str = "last_active"
-) -> List[Chat]:
+) -> list[Chat]:
     """Get chats matching the specified criteria."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _get_db_connection()
         cursor = conn.cursor()
         
         # Build base query
         query_parts = ["""
             SELECT 
-                chats.jid,
+                chats.jid as chat_jid,
                 chats.name,
                 chats.last_message_time,
                 messages.content as last_message,
-                messages.sender as last_sender,
+                messages.sender as last_sender_id,
                 messages.is_from_me as last_is_from_me
             FROM chats
         """]
@@ -371,11 +706,11 @@ def list_chats(
         result = []
         for chat_data in chats:
             chat = Chat(
-                jid=chat_data[0],
+                chat_jid=chat_data[0],
                 name=chat_data[1],
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
-                last_sender=chat_data[4],
+                last_sender_id=chat_data[4],
                 last_is_from_me=chat_data[5]
             )
             result.append(chat)
@@ -390,14 +725,14 @@ def list_chats(
             conn.close()
 
 
-def search_contacts(query: str) -> List[Contact]:
+def search_contacts(query: str) -> list[Contact]:
     """Search contacts by name or phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _get_db_connection()
         cursor = conn.cursor()
         
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
+        # Build wildcard pattern for partial matching.
+        search_pattern = "%" + query + "%"
         
         cursor.execute("""
             SELECT DISTINCT 
@@ -413,16 +748,41 @@ def search_contacts(query: str) -> List[Contact]:
         
         contacts = cursor.fetchall()
         
-        result = []
+        contacts_by_sender_id: dict[str, Contact] = {}
         for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
-        return result
+            chat_jid = (contact_data[0] or "").strip()
+            name = contact_data[1]
+
+            # Contacts search should return users only, even if group rows are present.
+            if not chat_jid or chat_jid.endswith("@g.us"):
+                continue
+
+            sender_alias = chat_jid.split("@", 1)[0].strip() if "@" in chat_jid else chat_jid
+            if not sender_alias:
+                continue
+
+            _, canonical_sender_id = _sender_id_candidates(conn, sender_alias)
+            existing = contacts_by_sender_id.get(canonical_sender_id)
+            canonical_chat_jid = canonical_sender_id
+
+            if existing is None:
+                contacts_by_sender_id[canonical_sender_id] = Contact(
+                    sender_id=canonical_sender_id,
+                    name=name,
+                    chat_jid=canonical_chat_jid if chat_jid == canonical_chat_jid else chat_jid,
+                )
+                continue
+
+            if (not existing.name) and name:
+                existing.name = name
+
+            if existing.chat_jid != canonical_chat_jid and chat_jid == canonical_chat_jid:
+                existing.chat_jid = canonical_chat_jid
+
+        return sorted(
+            contacts_by_sender_id.values(),
+            key=lambda contact: ((contact.name or "").lower(), contact.sender_id),
+        )
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -432,43 +792,48 @@ def search_contacts(query: str) -> List[Contact]:
             conn.close()
 
 
-def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
+def get_contact_chats(sender_id: str, limit: int = 20, page: int = 0) -> list[Chat]:
     """Get all chats involving the contact.
     
     Args:
-        jid: The contact's JID to search for
+        sender_id: Canonical normalized user ID (no JID suffix)
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _get_db_connection()
         cursor = conn.cursor()
+        sender_candidates, _ = _sender_id_candidates(conn, sender_id)
+        direct_chat_jids = _direct_chat_jids_for_candidates(sender_candidates)
+        sender_placeholders = ", ".join(["?"] * len(sender_candidates))
+        chat_placeholders = ", ".join(["?"] * len(direct_chat_jids))
         
         cursor.execute("""
             SELECT DISTINCT
-                c.jid,
+                c.jid as chat_jid,
                 c.name,
                 c.last_message_time,
                 m.content as last_message,
-                m.sender as last_sender,
+                m.sender as last_sender_id,
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN (""" + sender_placeholders + """)
+               OR c.jid IN (""" + chat_placeholders + """)
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
+        """, tuple(sender_candidates + direct_chat_jids + [limit, page * limit]))
         
         chats = cursor.fetchall()
         
         result = []
         for chat_data in chats:
             chat = Chat(
-                jid=chat_data[0],
+                chat_jid=chat_data[0],
                 name=chat_data[1],
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
-                last_sender=chat_data[4],
+                last_sender_id=chat_data[4],
                 last_is_from_me=chat_data[5]
             )
             result.append(chat)
@@ -483,11 +848,15 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
             conn.close()
 
 
-def get_last_interaction(jid: str) -> str:
+def get_last_interaction(sender_id: str) -> Optional[str]:
     """Get most recent message involving the contact."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _get_db_connection()
         cursor = conn.cursor()
+        sender_candidates, _ = _sender_id_candidates(conn, sender_id)
+        direct_chat_jids = _direct_chat_jids_for_candidates(sender_candidates)
+        sender_placeholders = ", ".join(["?"] * len(sender_candidates))
+        chat_placeholders = ", ".join(["?"] * len(direct_chat_jids))
         
         cursor.execute("""
             SELECT 
@@ -501,10 +870,11 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN (""" + sender_placeholders + """)
+               OR c.jid IN (""" + chat_placeholders + """)
             ORDER BY m.timestamp DESC
             LIMIT 1
-        """, (jid, jid))
+        """, tuple(sender_candidates + direct_chat_jids))
         
         msg_data = cursor.fetchone()
         
@@ -513,7 +883,7 @@ def get_last_interaction(jid: str) -> str:
             
         message = Message(
             timestamp=datetime.fromisoformat(msg_data[0]),
-            sender=msg_data[1],
+            sender_id=msg_data[1],
             chat_name=msg_data[2],
             content=msg_data[3],
             is_from_me=msg_data[4],
@@ -535,16 +905,16 @@ def get_last_interaction(jid: str) -> str:
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]:
     """Get chat metadata by JID."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _get_db_connection()
         cursor = conn.cursor()
         
         query = """
             SELECT 
-                c.jid,
+                c.jid as chat_jid,
                 c.name,
                 c.last_message_time,
                 m.content as last_message,
-                m.sender as last_sender,
+                m.sender as last_sender_id,
                 m.is_from_me as last_is_from_me
             FROM chats c
         """
@@ -564,11 +934,11 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
             return None
             
         return Chat(
-            jid=chat_data[0],
+            chat_jid=chat_data[0],
             name=chat_data[1],
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
-            last_sender=chat_data[4],
+            last_sender_id=chat_data[4],
             last_is_from_me=chat_data[5]
         )
         
@@ -580,26 +950,33 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
             conn.close()
 
 
-def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
-    """Get chat metadata by sender phone number."""
+def get_direct_chat_by_contact(sender_id: str) -> Optional[Chat]:
+    """Get direct chat metadata by canonical normalized user ID."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _get_db_connection()
         cursor = conn.cursor()
+        sender_candidates, resolved_canonical = _sender_id_candidates(conn, sender_id)
+        ordered_candidates = [resolved_canonical] + [
+            candidate for candidate in sender_candidates if candidate != resolved_canonical
+        ]
+        direct_chat_jids = _direct_chat_jids_for_candidates(ordered_candidates)
+        placeholders = ", ".join(["?"] * len(direct_chat_jids))
         
         cursor.execute("""
             SELECT 
-                c.jid,
+                c.jid as chat_jid,
                 c.name,
                 c.last_message_time,
                 m.content as last_message,
-                m.sender as last_sender,
+                m.sender as last_sender_id,
                 m.is_from_me as last_is_from_me
             FROM chats c
             LEFT JOIN messages m ON c.jid = m.chat_jid 
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE c.jid IN (""" + placeholders + """) AND c.jid NOT LIKE '%@g.us'
+            ORDER BY c.last_message_time DESC
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
+        """, tuple(direct_chat_jids))
         
         chat_data = cursor.fetchone()
         
@@ -607,11 +984,11 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             return None
             
         return Chat(
-            jid=chat_data[0],
+            chat_jid=chat_data[0],
             name=chat_data[1],
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
-            last_sender=chat_data[4],
+            last_sender_id=chat_data[4],
             last_is_from_me=chat_data[5]
         )
         
@@ -622,19 +999,24 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+def send_message(recipient: str, message: str, *, auth_headers: dict[str, str]) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
+        url = f"{WHATSAPP_API_BASE_URL}/api/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(
+            url,
+            json=payload,
+            headers=_validated_bridge_auth_headers(auth_headers),
+            timeout=30,
+        )
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -650,7 +1032,7 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
+def send_file(recipient: str, media_path: str, *, auth_headers: dict[str, str]) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
@@ -662,13 +1044,18 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
+        url = f"{WHATSAPP_API_BASE_URL}/api/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(
+            url,
+            json=payload,
+            headers=_validated_bridge_auth_headers(auth_headers),
+            timeout=30,
+        )
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -684,7 +1071,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
+def send_audio_message(recipient: str, media_path: str, *, auth_headers: dict[str, str]) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
@@ -702,13 +1089,18 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
+        url = f"{WHATSAPP_API_BASE_URL}/api/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(
+            url,
+            json=payload,
+            headers=_validated_bridge_auth_headers(auth_headers),
+            timeout=30,
+        )
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -724,7 +1116,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def download_media(message_id: str, chat_jid: str) -> Optional[str]:
+def download_media(message_id: str, chat_jid: str, *, auth_headers: dict[str, str]) -> Optional[str]:
     """Download media from a message and return the local file path.
     
     Args:
@@ -735,13 +1127,18 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
         The local file path if download was successful, None otherwise
     """
     try:
-        url = f"{WHATSAPP_API_BASE_URL}/download"
+        url = f"{WHATSAPP_API_BASE_URL}/api/download"
         payload = {
             "message_id": message_id,
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(
+            url,
+            json=payload,
+            headers=_validated_bridge_auth_headers(auth_headers),
+            timeout=30,
+        )
         
         if response.status_code == 200:
             result = response.json()

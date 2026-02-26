@@ -19,9 +19,8 @@ Here's an example of what you can do when it's connected to Claude.
 ### Prerequisites
 
 - Go
-- Python 3.6+
+- Python 3.11+
 - Anthropic Claude Desktop app (or Cursor)
-- UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.
 
 ### Steps
@@ -39,6 +38,9 @@ Here's an example of what you can do when it's connected to Claude.
 
    ```bash
    cd whatsapp-bridge
+   export WHATSAPP_BRIDGE_JWT_SECRET=change-me
+   export WHATSAPP_BRIDGE_JWT_AUDIENCE=whatsapp-bridge
+   export WHATSAPP_BRIDGE_JWT_ISSUER=omicron-api
    go run main.go
    ```
 
@@ -46,20 +48,63 @@ Here's an example of what you can do when it's connected to Claude.
 
    After approximately 20 days, you will might need to re-authenticate.
 
-3. **Connect to the MCP server**
+3. **Set up the Python MCP server dependencies**
 
-   Copy the below json with the appropriate {{PATH}} values:
+   ```bash
+   cd whatsapp-mcp-server
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
+   ```
+
+   If you are using conda instead of `venv`:
+
+   ```bash
+   conda activate whatsapp-mcp
+   cd whatsapp-mcp-server
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
+   ```
+
+4. **Run the MCP server (streamable HTTP)**
+
+   ```bash
+   cd whatsapp-mcp-server
+   source .venv/bin/activate
+   export WHATSAPP_BRIDGE_JWT_SECRET=change-me
+   export WHATSAPP_BRIDGE_JWT_AUDIENCE=whatsapp-bridge
+   export WHATSAPP_BRIDGE_JWT_ISSUER=omicron-api
+   export WHATSAPP_MCP_JWT_AUDIENCE=whatsapp-mcp
+   export WHATSAPP_MCP_REQUIRED_SCOPE=whatsapp:mcp
+   python main.py --transport streamable-http --host 127.0.0.1 --port 8000 --streamable-http-path /mcp
+   ```
+
+   If you are using conda, run the same command after `conda activate whatsapp-mcp`.
+
+   The streamable HTTP endpoint will be:
+
+   ```
+   http://127.0.0.1:8000/mcp
+   ```
+
+5. **Connect your MCP client**
+
+   - If your MCP client supports streamable HTTP, configure it to use `http://127.0.0.1:8000/mcp`.
+   - Include an `Authorization: Bearer <short-lived-internal-jwt>` header. The backend should mint
+     this JWT with `WHATSAPP_BRIDGE_JWT_SECRET`, include audience `whatsapp-mcp`, and pass it through
+     unchanged to bridge calls.
+   - If your MCP client expects stdio (for example some Claude Desktop/Cursor setups), use this process config instead:
 
    ```json
    {
      "mcpServers": {
        "whatsapp": {
-         "command": "{{PATH_TO_UV}}", // Run `which uv` and place the output here
+         "command": "{{PATH_TO_PYTHON}}", // Run `which python3` in whatsapp-mcp-server/.venv and place the output here
          "args": [
-           "--directory",
-           "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-mcp-server", // cd into the repo, run `pwd` and enter the output here + "/whatsapp-mcp-server"
-           "run",
-           "main.py"
+           "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-mcp-server/main.py", // cd into the repo, run `pwd` and enter the output here + "/whatsapp-mcp-server/main.py"
+           "--transport",
+           "stdio"
          ]
        }
      }
@@ -78,7 +123,7 @@ Here's an example of what you can do when it's connected to Claude.
    ~/.cursor/mcp.json
    ```
 
-4. **Restart Claude Desktop / Cursor**
+6. **Restart Claude Desktop / Cursor**
 
    Open Claude Desktop and you should now see WhatsApp as an available integration.
 
@@ -120,6 +165,14 @@ This application consists of two main components:
 - The database maintains tables for chats and messages
 - Messages are indexed for efficient searching and retrieval
 
+### Standard Identifier Terms
+
+- `sender_id`: Canonical normalized user ID (no JID suffix), for example `919930575574`
+- `chat_jid`: Chat identifier, for example `120363024375560616@g.us` or `919930575574`
+- `last_sender_id`: Canonical normalized user ID of the sender of the last message in a chat
+
+Note: the SQLite schema keeps legacy column names (`messages.sender`, `chats.jid`) for compatibility, while MCP-facing payloads use the standard terms above.
+
 ## Usage
 
 Once connected, you can interact with your WhatsApp contacts through Claude, leveraging Claude's AI capabilities in your WhatsApp conversations.
@@ -129,7 +182,11 @@ Once connected, you can interact with your WhatsApp contacts through Claude, lev
 Claude can access the following tools to interact with WhatsApp:
 
 - **search_contacts**: Search for contacts by name or phone number
-- **list_messages**: Retrieve messages with optional filters and context
+- **list_messages**: Retrieve messages with sender/chat/date filters and optional context (no text query)
+- **list_messages_for_sender_id**: Retrieve messages for one `sender_id` with pagination, optional time window, and optional context (`after_iso`/`before_iso` or `lookback_value`+`lookback_unit`)
+- **list_messages_for_chat_id**: Retrieve messages for one `chat_jid` with pagination, optional time window, and optional context (`after_iso`/`before_iso` or `lookback_value`+`lookback_unit`)
+- **search_messages**: Search message content with pagination and optional `sender_id`; use either absolute bounds (`after_iso`/`before_iso`) or relative lookback (`lookback_value`+`lookback_unit` where unit is `h|d|w`). If `query` is empty/null, a time window is required.
+- **search_chat_messages**: Search message content within one chat using `chat_jid` + query, with the same absolute/relative time-window pattern
 - **list_chats**: List available chats with metadata
 - **get_chat**: Get information about a specific chat
 - **get_direct_chat_by_contact**: Find a direct chat with a specific contact
@@ -169,7 +226,8 @@ By default, just the metadata of the media is stored in the local database. The 
 
 ## Troubleshooting
 
-- If you encounter permission issues when running uv, you may need to add it to your PATH or use the full path to the executable.
+- If you use streamable HTTP, ensure the server is running and your client points to the correct URL (default `http://127.0.0.1:8000/mcp`).
+- If the MCP server fails to start, make sure the configured Python path points to `whatsapp-mcp-server/.venv/bin/python3` (or your platform equivalent), and that dependencies were installed from `requirements.txt`.
 - Make sure both the Go application and the Python server are running for the integration to work properly.
 
 ### Authentication Issues

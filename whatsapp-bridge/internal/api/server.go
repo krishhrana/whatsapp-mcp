@@ -71,10 +71,18 @@ type ConnectResponse struct {
 	UpdatedAt      string `json:"updated_at,omitempty"`
 }
 
+type HealthResponse struct {
+	Status    string `json:"status"`
+	State     string `json:"state,omitempty"`
+	Connected bool   `json:"connected"`
+	UpdatedAt string `json:"updated_at"`
+}
+
 type bridgeAuthConfig struct {
-	jwtSecret []byte
-	audience  string
-	issuer    string
+	jwtSecret              []byte
+	audience               string
+	issuer                 string
+	allowedSubjectPrefixes []string
 }
 
 type bridgeJWTClaims struct {
@@ -217,11 +225,53 @@ func loadBridgeAuthConfig() (bridgeAuthConfig, error) {
 		issuer = "omicron-api"
 	}
 
+	allowedSubjectPrefixes := parseAllowedSubjectPrefixes(
+		os.Getenv("WHATSAPP_INTERNAL_ALLOWED_SUBJECT_PREFIXES"),
+		[]string{"omicron-api:", "whatsapp-session-controller:"},
+	)
+
 	return bridgeAuthConfig{
-		jwtSecret: []byte(secret),
-		audience:  audience,
-		issuer:    issuer,
+		jwtSecret:              []byte(secret),
+		audience:               audience,
+		issuer:                 issuer,
+		allowedSubjectPrefixes: allowedSubjectPrefixes,
 	}, nil
+}
+
+func parseAllowedSubjectPrefixes(raw string, defaults []string) []string {
+	source := strings.TrimSpace(raw)
+	if source == "" {
+		return defaults
+	}
+	parts := strings.FieldsFunc(source, func(r rune) bool { return r == ',' || r == ' ' })
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		normalized := strings.TrimSpace(part)
+		if normalized != "" {
+			result = append(result, normalized)
+		}
+	}
+	if len(result) == 0 {
+		return defaults
+	}
+	return result
+}
+
+func hasAllowedSubjectPrefix(subject string, allowedPrefixes []string) bool {
+	normalizedSubject := strings.TrimSpace(subject)
+	if normalizedSubject == "" {
+		return false
+	}
+	for _, prefix := range allowedPrefixes {
+		normalizedPrefix := strings.TrimSpace(prefix)
+		if normalizedPrefix == "" {
+			continue
+		}
+		if strings.HasPrefix(normalizedSubject, normalizedPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func requiredScopeForRoute(method string, path string) (string, bool) {
@@ -293,6 +343,10 @@ func withRequiredBridgeJWTAuth(authConfig bridgeAuthConfig, next http.HandlerFun
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		if !hasAllowedSubjectPrefix(claims.Subject, authConfig.allowedSubjectPrefixes) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 		if strings.TrimSpace(claims.RuntimeID) == "" {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -358,6 +412,30 @@ func waitForPostConnectStatus(timeout time.Duration) bootstrap.AuthStatus {
 			return last
 		}
 		time.Sleep(120 * time.Millisecond)
+	}
+}
+
+// healthHandler returns basic liveness/readiness metadata for orchestration probes.
+func healthHandler(runtime *whatsAppRuntime) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		status := bootstrap.GetAuthStatus()
+		connected := status.Connected
+		client := runtime.currentClient()
+		if client != nil && client.IsConnected() {
+			connected = true
+		}
+
+		writeJSON(w, http.StatusOK, HealthResponse{
+			Status:    "ok",
+			State:     status.State,
+			Connected: connected,
+			UpdatedAt: status.UpdatedAt.Format(time.RFC3339),
+		})
 	}
 }
 
@@ -592,6 +670,7 @@ func StartRESTServer(logger waLog.Logger, messageStore *storage.MessageStore, po
 	autoConnectOnStartup(runtime)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler(runtime))
 	mux.HandleFunc("/api/send", withRequiredBridgeJWTAuth(authConfig, sendHandler(runtime)))
 	mux.HandleFunc("/api/download", withRequiredBridgeJWTAuth(authConfig, downloadHandler(runtime)))
 	mux.HandleFunc("/api/connect", withRequiredBridgeJWTAuth(authConfig, connectHandler(runtime)))

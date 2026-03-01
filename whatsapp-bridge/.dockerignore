@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+store/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+bin/
+tmp/

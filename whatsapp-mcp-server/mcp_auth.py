@@ -152,5 +152,4 @@ def bridge_auth_headers_from_request_context() -> dict[str, str]:
         raise RuntimeError("Missing authenticated MCP access token in request context.")
     if not access_token.token.strip():
         raise RuntimeError("Authenticated MCP access token is empty.")
-    print(access_token.token)
     return {"Authorization": f"Bearer {access_token.token}"}

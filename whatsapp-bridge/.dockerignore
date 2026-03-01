@@ -1,6 +1,14 @@
 .git
 .gitignore
-.env
+.dockerignore
+.env*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.cer
+*.der
 store/
 *.db
 *.sqlite
@@ -8,3 +16,8 @@ store/
 *.log
 bin/
 tmp/
+dist/
+coverage/
+.vscode/
+.idea/
+.DS_Store

@@ -37,6 +37,20 @@ def _required_mcp_scope() -> str:
     return scope
 
 
+def _allowed_subject_prefixes() -> tuple[str, ...]:
+    raw = (os.getenv("WHATSAPP_INTERNAL_ALLOWED_SUBJECT_PREFIXES") or "").strip()
+    if not raw:
+        return ("omicron-api:", "whatsapp-session-controller:")
+    values = tuple(
+        part.strip()
+        for part in raw.replace(",", " ").split()
+        if part.strip()
+    )
+    if not values:
+        return ("omicron-api:", "whatsapp-session-controller:")
+    return values
+
+
 def _auth_issuer_url() -> str:
     return os.getenv("WHATSAPP_MCP_AUTH_ISSUER_URL", "http://127.0.0.1:8000").strip()
 
@@ -60,10 +74,18 @@ def _parse_scope_claims(raw_scope: Any, raw_scopes: Any) -> list[str]:
 
 
 class InternalJWTTokenVerifier(TokenVerifier):
-    def __init__(self, *, jwt_secret: str, expected_audience: str, expected_issuer: str) -> None:
+    def __init__(
+        self,
+        *,
+        jwt_secret: str,
+        expected_audience: str,
+        expected_issuer: str,
+        allowed_subject_prefixes: tuple[str, ...],
+    ) -> None:
         self._jwt_secret = jwt_secret
         self._expected_audience = expected_audience
         self._expected_issuer = expected_issuer
+        self._allowed_subject_prefixes = allowed_subject_prefixes
 
     async def verify_token(self, token: str) -> AccessToken | None:
         try:
@@ -81,6 +103,8 @@ class InternalJWTTokenVerifier(TokenVerifier):
         subject = claims.get("sub")
         runtime_id = claims.get("runtime_id")
         if not isinstance(subject, str) or not subject.strip():
+            return None
+        if not any(subject.startswith(prefix) for prefix in self._allowed_subject_prefixes):
             return None
         if not isinstance(runtime_id, str) or not runtime_id.strip():
             return None
@@ -118,6 +142,7 @@ def build_token_verifier() -> TokenVerifier:
         jwt_secret=_required_internal_jwt_secret(),
         expected_audience=_required_mcp_audience(),
         expected_issuer=_required_token_issuer(),
+        allowed_subject_prefixes=_allowed_subject_prefixes(),
     )
 
 

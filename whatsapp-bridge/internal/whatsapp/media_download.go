@@ -52,6 +52,11 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 
 // DownloadMedia fetches message media from WhatsApp and persists it locally.
 func DownloadMedia(client *whatsmeow.Client, messageStore *storage.MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
+	runtimePaths, err := storage.ResolveRuntimePathsFromEnv()
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to resolve runtime media paths: %w", err)
+	}
+
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err := messageStore.GetMediaInfo(messageID, chatJID)
 	if err != nil {
 		if mediaType, filename, err = messageStore.GetMessageMediaTypeAndFilename(messageID, chatJID); err != nil {
@@ -63,7 +68,7 @@ func DownloadMedia(client *whatsmeow.Client, messageStore *storage.MessageStore,
 		return false, "", "", "", fmt.Errorf("not a media message")
 	}
 
-	chatDir := filepath.Join("store", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := filepath.Join(runtimePaths.HotMediaRoot, strings.ReplaceAll(chatJID, ":", "_"))
 	if err := os.MkdirAll(chatDir, 0o755); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}

@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"whatsapp-client/internal/storage"
 )
 
 // SetupClient initializes the WhatsApp client and device store.
@@ -17,11 +19,22 @@ func SetupClient(logger waLog.Logger) (*whatsmeow.Client, error) {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 	SetConnecting("Initializing WhatsApp client")
 
-	if err := os.MkdirAll("store", 0o755); err != nil {
+	runtimePaths, err := storage.ResolveRuntimePathsFromEnv()
+	if err != nil {
+		SetAuthError("Invalid runtime storage scope configuration")
+		return nil, fmt.Errorf("failed to resolve runtime storage paths: %w", err)
+	}
+
+	deviceStoreDir := filepath.Dir(runtimePaths.PersistentWhatsAppDB)
+	if err := os.MkdirAll(deviceStoreDir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %w", err)
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	deviceDBDSN := fmt.Sprintf(
+		"file:%s?_foreign_keys=on",
+		runtimePaths.PersistentWhatsAppDB,
+	)
+	container, err := sqlstore.New(context.Background(), "sqlite3", deviceDBDSN, dbLog)
 	if err != nil {
 		SetAuthError("Failed to initialize WhatsApp device store")
 		return nil, fmt.Errorf("failed to connect to database: %w", err)

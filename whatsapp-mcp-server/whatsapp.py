@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Optional, Tuple
 import os
 import requests
@@ -11,8 +12,72 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = os.getenv("WHATSAPP_BRIDGE_API_BASE_URL", "http://127.0.0.1:8080")
+
+_RUNTIME_SCOPE_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+
+
+def _is_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _resolve_runtime_scope() -> str:
+    scope = (os.getenv("WHATSAPP_RUNTIME_USER_SCOPE") or "").strip()
+    ecs_mode = _is_truthy(os.getenv("WHATSAPP_RUNTIME_ECS_MODE"))
+    if not scope:
+        if ecs_mode:
+            raise RuntimeError(
+                "WHATSAPP_RUNTIME_USER_SCOPE is required when WHATSAPP_RUNTIME_ECS_MODE=true."
+            )
+        return "local-dev"
+    if not _RUNTIME_SCOPE_UUID_RE.fullmatch(scope):
+        raise RuntimeError(
+            f"WHATSAPP_RUNTIME_USER_SCOPE must be a UUID value. Received: {scope!r}"
+        )
+    return scope.lower()
+
+
+def _persistent_store_root() -> str:
+    configured = (os.getenv("WHATSAPP_MESSAGE_STORE_PERSISTENT_DIR") or "").strip()
+    if configured:
+        return configured
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "whatsapp-bridge",
+        "store",
+    )
+
+
+def _hot_store_root() -> str:
+    configured = (os.getenv("WHATSAPP_MESSAGE_STORE_HOT_DIR") or "").strip()
+    if configured:
+        return configured
+    return "/tmp/whatsapp-store"
+
+
+def _runtime_messages_db_path() -> str:
+    scope = _resolve_runtime_scope()
+    hot_path = os.path.join(_hot_store_root(), "users", scope, "messages.db")
+    if os.path.exists(hot_path):
+        return hot_path
+
+    ecs_mode = _is_truthy(os.getenv("WHATSAPP_RUNTIME_ECS_MODE"))
+    if ecs_mode:
+        raise RuntimeError(
+            f"Hot runtime messages DB not found at {hot_path}. "
+            "ECS mode requires hot-path DB availability."
+        )
+
+    persistent_path = os.path.join(_persistent_store_root(), "users", scope, "messages.db")
+    if os.path.exists(persistent_path):
+        return persistent_path
+    return hot_path
 
 
 def _validated_bridge_auth_headers(auth_headers: dict[str, str] | None) -> dict[str, str]:
@@ -25,7 +90,7 @@ def _validated_bridge_auth_headers(auth_headers: dict[str, str] | None) -> dict[
 
 
 def _get_db_connection() -> sqlite3.Connection:
-    return sqlite3.connect(MESSAGES_DB_PATH)
+    return sqlite3.connect(_runtime_messages_db_path())
 
 @dataclass
 class Message:

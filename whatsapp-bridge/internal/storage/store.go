@@ -3,8 +3,12 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,7 +24,86 @@ type Message struct {
 
 // MessageStore manages chat/message persistence.
 type MessageStore struct {
-	db *sql.DB
+	db               *sql.DB
+	flushTickerStop  chan struct{}
+	flushTickerDone  chan struct{}
+	flushMutex       sync.Mutex
+	persistentDBPath string
+}
+
+type messageStoreMode string
+
+const (
+	messageStoreModeDirect       messageStoreMode = "direct"
+	messageStoreModeHotLocalSync messageStoreMode = "hot_local_sync"
+	defaultPersistentStoreDir                     = "store"
+	defaultHotStoreDir                            = "/tmp/whatsapp-store"
+	defaultSyncIntervalSeconds                    = 5
+)
+
+type messageStoreConfig struct {
+	mode                messageStoreMode
+	syncIntervalSeconds int
+	runtimePaths        RuntimePaths
+}
+
+func parseMessageStoreConfig() (messageStoreConfig, error) {
+	mode := strings.TrimSpace(os.Getenv("WHATSAPP_MESSAGE_STORE_MODE"))
+	if mode == "" {
+		mode = string(messageStoreModeDirect)
+	}
+	normalizedMode := messageStoreMode(strings.ToLower(mode))
+	if normalizedMode != messageStoreModeHotLocalSync {
+		normalizedMode = messageStoreModeDirect
+	}
+
+	runtimePaths, err := ResolveRuntimePathsFromEnv()
+	if err != nil {
+		return messageStoreConfig{}, err
+	}
+
+	syncInterval := defaultSyncIntervalSeconds
+	if raw := strings.TrimSpace(os.Getenv("WHATSAPP_MESSAGE_STORE_SYNC_INTERVAL_SECONDS")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			syncInterval = parsed
+		}
+	}
+
+	return messageStoreConfig{
+		mode:                normalizedMode,
+		syncIntervalSeconds: syncInterval,
+		runtimePaths:        runtimePaths,
+	}, nil
+}
+
+func ensureDir(path string) error {
+	if path == "" {
+		return fmt.Errorf("directory path is empty")
+	}
+	return os.MkdirAll(path, 0o755)
+}
+
+func copyFile(src string, dst string) error {
+	source, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	target, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer target.Close()
+
+	if _, err := io.Copy(target, source); err != nil {
+		return err
+	}
+	return target.Sync()
+}
+
+func quoteSQLitePath(path string) string {
+	return "'" + strings.ReplaceAll(path, "'", "''") + "'"
 }
 
 type schemaColumn struct {
@@ -207,13 +290,8 @@ func runSchemaMigrations(db *sql.DB) error {
 	return nil
 }
 
-// NewMessageStore initializes the sqlite store and runs schema migrations.
-func NewMessageStore() (*MessageStore, error) {
-	if err := os.MkdirAll("store", 0o755); err != nil {
-		return nil, fmt.Errorf("failed to create store directory: %v", err)
-	}
-
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+func openMessageDB(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", path))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -275,11 +353,127 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to run schema migrations: %v", err)
 	}
 
-	return &MessageStore{db: db}, nil
+	return db, nil
+}
+
+func (store *MessageStore) startSnapshotTicker(interval time.Duration) {
+	store.flushTickerStop = make(chan struct{})
+	store.flushTickerDone = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		defer close(store.flushTickerDone)
+		for {
+			select {
+			case <-ticker.C:
+				if err := store.flushSnapshot(); err != nil {
+					fmt.Printf("Warning: failed to flush message snapshot to persistent store: %v\n", err)
+				}
+			case <-store.flushTickerStop:
+				return
+			}
+		}
+	}()
+}
+
+func (store *MessageStore) flushSnapshot() error {
+	if store == nil || store.db == nil || store.persistentDBPath == "" {
+		return nil
+	}
+	store.flushMutex.Lock()
+	defer store.flushMutex.Unlock()
+
+	tmpPath := store.persistentDBPath + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(store.persistentDBPath), 0o755); err != nil {
+		return fmt.Errorf("failed to create persistent snapshot directory: %w", err)
+	}
+	_ = os.Remove(tmpPath)
+
+	if _, err := store.db.Exec(`PRAGMA wal_checkpoint(PASSIVE);`); err != nil {
+		return fmt.Errorf("failed to checkpoint WAL before snapshot: %w", err)
+	}
+	if _, err := store.db.Exec("VACUUM INTO " + quoteSQLitePath(tmpPath)); err != nil {
+		return fmt.Errorf("failed to write sqlite snapshot: %w", err)
+	}
+	if err := os.Rename(tmpPath, store.persistentDBPath); err != nil {
+		return fmt.Errorf("failed to atomically move sqlite snapshot: %w", err)
+	}
+	return nil
+}
+
+func restorePersistentSnapshot(hotDBPath string, persistentDBPath string) error {
+	if _, err := os.Stat(persistentDBPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to inspect persistent message DB: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(hotDBPath), 0o755); err != nil {
+		return fmt.Errorf("failed to create hot message DB directory: %w", err)
+	}
+	if err := copyFile(persistentDBPath, hotDBPath); err != nil {
+		return fmt.Errorf("failed to restore persistent message snapshot: %w", err)
+	}
+	return nil
+}
+
+// NewMessageStore initializes the sqlite store and runs schema migrations.
+func NewMessageStore() (*MessageStore, error) {
+	cfg, err := parseMessageStoreConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve runtime storage paths: %w", err)
+	}
+
+	persistentDir := filepath.Dir(cfg.runtimePaths.PersistentMessagesDB)
+	if err := ensureDir(persistentDir); err != nil {
+		return nil, fmt.Errorf("failed to create persistent store directory: %v", err)
+	}
+
+	persistentDBPath := cfg.runtimePaths.PersistentMessagesDB
+	openPath := persistentDBPath
+	store := &MessageStore{}
+
+	if cfg.mode == messageStoreModeHotLocalSync {
+		hotStoreDir := filepath.Dir(cfg.runtimePaths.HotMessagesDB)
+		if err := ensureDir(hotStoreDir); err != nil {
+			return nil, fmt.Errorf("failed to create hot store directory: %v", err)
+		}
+		hotDBPath := cfg.runtimePaths.HotMessagesDB
+		if err := restorePersistentSnapshot(hotDBPath, persistentDBPath); err != nil {
+			return nil, err
+		}
+		openPath = hotDBPath
+		store.persistentDBPath = persistentDBPath
+	}
+
+	db, err := openMessageDB(openPath)
+	if err != nil {
+		return nil, err
+	}
+	store.db = db
+
+	if cfg.mode == messageStoreModeHotLocalSync {
+		store.startSnapshotTicker(time.Duration(cfg.syncIntervalSeconds) * time.Second)
+	}
+	return store, nil
 }
 
 // Close closes the underlying sqlite connection.
 func (store *MessageStore) Close() error {
+	if store == nil || store.db == nil {
+		return nil
+	}
+	if store.flushTickerStop != nil {
+		close(store.flushTickerStop)
+		if store.flushTickerDone != nil {
+			<-store.flushTickerDone
+		}
+		store.flushTickerStop = nil
+		store.flushTickerDone = nil
+	}
+	if err := store.flushSnapshot(); err != nil {
+		fmt.Printf("Warning: final message snapshot flush failed: %v\n", err)
+	}
 	return store.db.Close()
 }
 
@@ -308,6 +502,9 @@ func (store *MessageStore) Reset() error {
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit reset transaction: %v", err)
+	}
+	if err := store.flushSnapshot(); err != nil {
+		return fmt.Errorf("failed to flush reset snapshot: %v", err)
 	}
 	return nil
 }

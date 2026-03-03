@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
-FROM python:3.13-slim
+ARG TARGETPLATFORM=linux/arm64
+FROM --platform=$TARGETPLATFORM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1

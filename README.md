@@ -41,6 +41,14 @@ Here's an example of what you can do when it's connected to Claude.
    export WHATSAPP_BRIDGE_JWT_SECRET=change-me
    export WHATSAPP_BRIDGE_JWT_AUDIENCE=whatsapp-bridge
    export WHATSAPP_BRIDGE_JWT_ISSUER=omicron-api
+   # Runtime scope: required in ECS mode, optional in local dev mode.
+   export WHATSAPP_RUNTIME_ECS_MODE=false
+   export WHATSAPP_RUNTIME_USER_SCOPE=da537387-a2e6-4003-93d7-35935deec7c9
+   # Optional: faster runtime message reads/writes with periodic durable snapshots.
+   export WHATSAPP_MESSAGE_STORE_MODE=hot_local_sync
+   export WHATSAPP_MESSAGE_STORE_PERSISTENT_DIR=store
+   export WHATSAPP_MESSAGE_STORE_HOT_DIR=/tmp/whatsapp-store
+   export WHATSAPP_MESSAGE_STORE_SYNC_INTERVAL_SECONDS=5
    go run main.go
    ```
 
@@ -75,6 +83,10 @@ Here's an example of what you can do when it's connected to Claude.
    export WHATSAPP_BRIDGE_JWT_SECRET=change-me
    export WHATSAPP_BRIDGE_JWT_AUDIENCE=whatsapp-bridge
    export WHATSAPP_BRIDGE_JWT_ISSUER=omicron-api
+   export WHATSAPP_RUNTIME_ECS_MODE=false
+   export WHATSAPP_RUNTIME_USER_SCOPE=da537387-a2e6-4003-93d7-35935deec7c9
+   export WHATSAPP_MESSAGE_STORE_PERSISTENT_DIR=../whatsapp-bridge/store
+   export WHATSAPP_MESSAGE_STORE_HOT_DIR=/tmp/whatsapp-store
    export WHATSAPP_MCP_JWT_AUDIENCE=whatsapp-mcp
    export WHATSAPP_MCP_REQUIRED_SCOPE=whatsapp:mcp
    python main.py --transport streamable-http --host 127.0.0.1 --port 8000 --streamable-http-path /mcp
@@ -161,9 +173,14 @@ This application consists of two main components:
 
 ### Data Storage
 
-- All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory
-- The database maintains tables for chats and messages
-- Messages are indexed for efficient searching and retrieval
+- Runtime storage is user-scoped using `users/<scope>` (where `<scope>` is `WHATSAPP_RUNTIME_USER_SCOPE`).
+- Bridge durable SQLite paths:
+  - `messages.db`: `<WHATSAPP_MESSAGE_STORE_PERSISTENT_DIR>/users/<scope>/messages.db`
+  - `whatsapp.db`: `<WHATSAPP_MESSAGE_STORE_PERSISTENT_DIR>/users/<scope>/whatsapp.db`
+- In `hot_local_sync` mode, bridge writes to hot local DB at
+  `<WHATSAPP_MESSAGE_STORE_HOT_DIR>/users/<scope>/messages.db` and periodically snapshots to durable storage.
+- MCP reads the hot DB path first. In ECS mode (`WHATSAPP_RUNTIME_ECS_MODE=true`), missing scope/hot DB is a hard failure.
+- Messages are indexed for efficient searching and retrieval.
 
 ### Standard Identifier Terms
 
@@ -236,6 +253,6 @@ By default, just the metadata of the media is stored in the local database. The 
 - **WhatsApp Already Logged In**: If your session is already active, the Go bridge will automatically reconnect without showing a QR code.
 - **Device Limit Reached**: WhatsApp limits the number of linked devices. If you reach this limit, you'll need to remove an existing device from WhatsApp on your phone (Settings > Linked Devices).
 - **No Messages Loading**: After initial authentication, it can take several minutes for your message history to load, especially if you have many chats.
-- **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
+- **WhatsApp Out of Sync**: Delete the scoped DB files under `users/<scope>/` in your persistent store root and restart the bridge to re-authenticate.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.

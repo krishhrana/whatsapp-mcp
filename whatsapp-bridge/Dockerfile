@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.23-bookworm AS builder
+ARG TARGETPLATFORM=linux/arm64
+FROM --platform=$TARGETPLATFORM golang:1.25-bookworm AS builder
+
+ARG TARGETOS=linux
+ARG TARGETARCH=arm64
 
 WORKDIR /src
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
 
 COPY go.mod go.sum ./
 RUN go mod download
@@ -14,8 +14,8 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 
-ENV CGO_ENABLED=1 GOOS=linux GOARCH=amd64
-RUN go build -trimpath -ldflags="-s -w" -o /out/whatsapp-bridge ./cmd/whatsapp-bridge
+RUN CGO_ENABLED=1 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/whatsapp-bridge ./cmd/whatsapp-bridge
 
 
 FROM debian:bookworm-slim AS runtime

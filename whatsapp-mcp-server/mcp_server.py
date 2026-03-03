@@ -7,9 +7,10 @@ from starlette.responses import JSONResponse
 from mcp_auth import build_auth_settings, build_token_verifier
 
 
-def create_mcp_server() -> FastMCP:
+def create_mcp_server(*, host: str) -> FastMCP:
     server = FastMCP(
         "whatsapp",
+        host=host,
         auth=build_auth_settings(),
         token_verifier=build_token_verifier(),
     )

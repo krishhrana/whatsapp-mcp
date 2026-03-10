@@ -39,12 +39,54 @@ func (r *whatsAppRuntime) detachClient() *whatsmeow.Client {
 	return client
 }
 
+func (r *whatsAppRuntime) currentMessageStore() *storage.MessageStore {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.messageStore
+}
+
+func (r *whatsAppRuntime) detachMessageStore() *storage.MessageStore {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	messageStore := r.messageStore
+	r.messageStore = nil
+	return messageStore
+}
+
+func (r *whatsAppRuntime) ensureMessageStore() (*storage.MessageStore, error) {
+	r.mu.RLock()
+	existing := r.messageStore
+	r.mu.RUnlock()
+	if existing != nil {
+		return existing, nil
+	}
+
+	created, err := storage.NewMessageStore()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize message store: %w", err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.messageStore != nil {
+		_ = created.Close()
+		return r.messageStore, nil
+	}
+	r.messageStore = created
+	return created, nil
+}
+
 func (r *whatsAppRuntime) newClient() (*whatsmeow.Client, error) {
+	messageStore, err := r.ensureMessageStore()
+	if err != nil {
+		return nil, err
+	}
+
 	client, err := bootstrap.SetupClient(r.logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize WhatsApp client: %w", err)
 	}
-	whatsapp.WireEventHandlers(client, r.messageStore, r.logger)
+	whatsapp.WireEventHandlers(client, messageStore, r.logger)
 	return client, nil
 }
 

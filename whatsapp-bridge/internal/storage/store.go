@@ -106,6 +106,13 @@ func quoteSQLitePath(path string) string {
 	return "'" + strings.ReplaceAll(path, "'", "''") + "'"
 }
 
+func normalizeToUTC(value time.Time) time.Time {
+	if value.IsZero() {
+		return value
+	}
+	return value.UTC()
+}
+
 type schemaColumn struct {
 	name       string
 	definition string
@@ -198,6 +205,22 @@ func runSchemaMigrations(db *sql.DB) error {
 		WHERE INSTR(sender, '@') > 1
 	`); err != nil {
 		return fmt.Errorf("failed to normalize messages.sender: %v", err)
+	}
+
+	if _, err := db.Exec(`
+		UPDATE messages
+		SET timestamp = COALESCE(strftime('%Y-%m-%d %H:%M:%S', timestamp) || '+00:00', timestamp)
+		WHERE timestamp IS NOT NULL;
+
+		UPDATE chats
+		SET last_message_time = COALESCE(strftime('%Y-%m-%d %H:%M:%S', last_message_time) || '+00:00', last_message_time)
+		WHERE last_message_time IS NOT NULL;
+
+		UPDATE sender_id_aliases
+		SET updated_at = COALESCE(strftime('%Y-%m-%d %H:%M:%S', updated_at) || '+00:00', updated_at)
+		WHERE updated_at IS NOT NULL;
+	`); err != nil {
+		return fmt.Errorf("failed to normalize timestamp columns to UTC: %v", err)
 	}
 
 	if _, err := db.Exec(`
@@ -513,7 +536,7 @@ func (store *MessageStore) Reset() error {
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		jid, name, normalizeToUTC(lastMessageTime),
 	)
 	return err
 }
@@ -566,7 +589,7 @@ func (store *MessageStore) StoreSenderAliases(canonicalID string, aliases []stri
 	defer stmt.Close()
 
 	for alias := range unique {
-		if _, err := stmt.Exec(alias, canonical, updatedAt); err != nil {
+		if _, err := stmt.Exec(alias, canonical, normalizeToUTC(updatedAt)); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -703,7 +726,7 @@ func (store *MessageStore) StoreMessage(
 		`INSERT OR REPLACE INTO messages
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		id, chatJID, sender, content, normalizeToUTC(timestamp), isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
 }

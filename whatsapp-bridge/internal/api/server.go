@@ -186,8 +186,16 @@ func downloadHandler(runtime *whatsAppRuntime) http.HandlerFunc {
 			})
 			return
 		}
+		messageStore := runtime.currentMessageStore()
+		if messageStore == nil {
+			writeJSON(w, http.StatusServiceUnavailable, DownloadMediaResponse{
+				Success: false,
+				Message: "Message store is not initialized. Start connect first.",
+			})
+			return
+		}
 
-		success, mediaType, filename, path, err := whatsapp.DownloadMedia(client, runtime.messageStore, req.MessageID, req.ChatJID)
+		success, mediaType, filename, path, err := whatsapp.DownloadMedia(client, messageStore, req.MessageID, req.ChatJID)
 		if !success || err != nil {
 			errMsg := "Unknown error"
 			if err != nil {
@@ -510,11 +518,66 @@ func clearLocalDeviceCredentials(ctx context.Context, client *whatsmeow.Client) 
 	return client.Store.Delete(ctx)
 }
 
-func clearLocalMessageCache(messageStore *storage.MessageStore) error {
-	if messageStore == nil {
+func removeSQLiteDatabaseArtifacts(dbPath string) error {
+	trimmedPath := strings.TrimSpace(dbPath)
+	if trimmedPath == "" {
 		return nil
 	}
-	return messageStore.Reset()
+	artifacts := []string{
+		trimmedPath,
+		trimmedPath + "-wal",
+		trimmedPath + "-shm",
+		trimmedPath + "-journal",
+	}
+	var failures []string
+	for _, artifact := range artifacts {
+		if err := os.Remove(artifact); err != nil && !os.IsNotExist(err) {
+			failures = append(failures, fmt.Sprintf("%s: %v", artifact, err))
+		}
+	}
+	if len(failures) > 0 {
+		return errors.New(strings.Join(failures, "; "))
+	}
+	return nil
+}
+
+func clearLocalRuntimeStorage(runtime *whatsAppRuntime) error {
+	if runtime == nil {
+		return nil
+	}
+
+	messageStore := runtime.detachMessageStore()
+	if messageStore != nil {
+		if err := messageStore.Close(); err != nil {
+			return fmt.Errorf("failed to close message store before cleanup: %w", err)
+		}
+	}
+
+	runtimePaths, err := storage.ResolveRuntimePathsFromEnv()
+	if err != nil {
+		return fmt.Errorf("failed to resolve runtime storage paths for cleanup: %w", err)
+	}
+
+	seen := map[string]struct{}{}
+	toDelete := []string{
+		runtimePaths.HotMessagesDB,
+		runtimePaths.PersistentMessagesDB,
+		runtimePaths.PersistentWhatsAppDB,
+	}
+	for _, dbPath := range toDelete {
+		normalized := strings.TrimSpace(dbPath)
+		if normalized == "" {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		if err := removeSQLiteDatabaseArtifacts(normalized); err != nil {
+			return fmt.Errorf("failed to remove database artifacts for %s: %w", normalized, err)
+		}
+	}
+	return nil
 }
 
 // revokeDisconnectHandler revokes the linked device and clears local WhatsApp state.
@@ -559,11 +622,11 @@ func revokeDisconnectHandler(runtime *whatsAppRuntime) http.HandlerFunc {
 					return
 				}
 
-				if cacheErr := clearLocalMessageCache(runtime.messageStore); cacheErr != nil {
+				if cacheErr := clearLocalRuntimeStorage(runtime); cacheErr != nil {
 					writeJSON(w, http.StatusInternalServerError, DisconnectResponse{
 						Success: false,
 						Message: fmt.Sprintf(
-							"Failed to revoke WhatsApp device (%v); local credentials were cleared but message cleanup failed (%v)",
+							"Failed to revoke WhatsApp device (%v); local credentials were cleared but local storage cleanup failed (%v)",
 							err,
 							cacheErr,
 						),
@@ -582,7 +645,11 @@ func revokeDisconnectHandler(runtime *whatsAppRuntime) http.HandlerFunc {
 			client.Disconnect()
 		}
 
-		if err := clearLocalMessageCache(runtime.messageStore); err != nil {
+		if client.IsConnected() {
+			client.Disconnect()
+		}
+
+		if err := clearLocalRuntimeStorage(runtime); err != nil {
 			writeJSON(w, http.StatusInternalServerError, DisconnectResponse{
 				Success: false,
 				Message: fmt.Sprintf("Failed to clear local WhatsApp data: %v", err),
